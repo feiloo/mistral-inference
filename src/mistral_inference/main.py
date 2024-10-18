@@ -16,6 +16,9 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_inference.generate import generate, generate_mamba
 from mistral_inference.mamba import Mamba
 from mistral_inference.transformer import Transformer
+from uuid import uuid4
+session = uuid4()
+convodb = f'convodb_{session}.jsonl'
 
 
 def is_torchrun() -> bool:
@@ -55,6 +58,22 @@ def pad_and_convert_to_tensor(list_of_lists: List[List[int]], pad_id: int) -> Li
 
     return padded_lists
 
+#- by codestral-mamba-7b-0.1
+def multiline_input(prompt, max_lines):
+    print(prompt)
+
+    lines = []
+    for i in range(max_lines):
+        try:
+            line = input()
+            lines.append(line)
+        except EOFError:
+            break
+
+    text = '\n'.join(lines)
+    return text
+#-#
+from mistral_common.tokens.tokenizers.sentencepiece import InstructTokenizerV2
 
 def interactive(
     model_path: str,
@@ -86,10 +105,19 @@ def interactive(
 
     prompt: str = ""
     messages: List[UserMessage | AssistantMessage] = []
+    print('now saving, is supported too')
+    import json
+    from datetime import datetime
 
     while True:
         if should_print:
-            user_input = input("Prompt: ")
+            #user_input = input("Prompt: ")
+            user_input = multiline_input("Prompt: ", 200)
+            print('inferring...')
+
+            with open(convodb, 'a') as f:
+                f.write(json.dumps({'user_input':user_input, 'date':str(datetime.now().isoformat())})+'\n')
+
 
             if instruct:
                 messages += [UserMessage(content=user_input)]
@@ -121,6 +149,8 @@ def interactive(
         )
 
         answer = tokenizer.decode(generated_tokens[0])
+        with open(convodb, 'a') as f:
+            f.write(json.dumps({'codestral-mamba-7b_answer':answer, 'date':str(datetime.now().isoformat())})+'\n')
 
         if should_print:
             print(answer)
@@ -130,6 +160,70 @@ def interactive(
             messages += [AssistantMessage(content=answer)]
         else:
             prompt += answer
+
+import json
+from datetime import datetime
+
+class Api:
+    def __init__(self,
+        model_path: str,
+        num_pipeline_ranks: int = 1,
+        instruct: bool = False,
+        lora_path: Optional[str] = None,
+    ) -> None:
+        if is_torchrun():
+            torch.distributed.init_process_group()
+            torch.cuda.set_device(torch.distributed.get_rank())
+            should_print = torch.distributed.get_rank() == 0
+
+            num_pipeline_ranks = torch.distributed.get_world_size()
+        else:
+            should_print = True
+            num_pipeline_ranks = 1
+
+        self.mistral_tokenizer: MistralTokenizer = load_tokenizer(Path(model_path))
+        self.tokenizer: Tokenizer = self.mistral_tokenizer.instruct_tokenizer.tokenizer
+
+        model_cls = get_model_cls(model_path)
+        self.model = model_cls.from_folder(Path(model_path), max_batch_size=3, num_pipeline_ranks=num_pipeline_ranks)
+
+        # load LoRA
+        if lora_path is not None:
+            self.model.load_lora(Path(lora_path))
+
+
+        '''
+        prompt: str = ""
+        messages: List[UserMessage | AssistantMessage] = []
+        print('now saving, is supported too')
+        '''
+
+    def __call__(self, user_input, messages=[], tools=[], max_tokens: int = 100, temperature: float = 0.7):
+        messages += [UserMessage(content=user_input)]
+        chat_completion_request = ChatCompletionRequest(messages=messages, tools=tools)
+
+        tokens = self.mistral_tokenizer.encode_chat_completion(chat_completion_request).tokens
+
+        if is_torchrun():
+            dist.broadcast(length_tensor, src=0)
+
+
+        generate_fn = generate if isinstance(self.model, Transformer) else generate_mamba
+        generated_tokens, _ = generate_fn(  # type: ignore[operator]
+            [tokens],
+            self.model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            eos_id=self.tokenizer.eos_id,
+        )
+
+        #print(generated_tokens)
+        answer = self.tokenizer.decode(generated_tokens[0])
+        #print(self.tokenizer.to_string(generated_tokens[0]))
+        messages += [AssistantMessage(content=answer)]
+        #from pdb import set_trace
+        #set_trace()
+        return answer, messages
 
 
 def demo(
@@ -195,6 +289,13 @@ def demo(
             print(w)
             logging.debug("Logprobs: %s", logprob)
             print("=====================")
+
+
+def get_api():
+    api = Api('', instruct=True)
+    msgs = []
+    answer, msgs = api(' ', msgs)
+    return api
 
 
 def mistral_chat() -> None:
